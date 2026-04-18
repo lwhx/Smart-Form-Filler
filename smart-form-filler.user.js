@@ -676,6 +676,7 @@
                 showToast(msg, 'success');
             }
         } catch (e) {
+            _dataDirty = true; // 同步失败，保留脏标记
             syncState.lastError = e.message;
             console.error('[Autofill] 同步到云端失败:', e);
             if (!silent) showToast(`同步失败: ${e.message}`, 'error');
@@ -923,13 +924,20 @@
 
     // 防抖自动上传到云端（避免频繁请求）
     let _autoSyncTimer = null;
+    let _dataDirty = false; // 脏标记：数据是否变更
+    function markDirty() {
+        _dataDirty = true;
+    }
     function scheduleAutoSync() {
         if (!SUPABASE_CONFIG.isEnabled) return;
         if (_autoSyncTimer) clearTimeout(_autoSyncTimer);
         _autoSyncTimer = setTimeout(async () => {
+            if (!_dataDirty) return; // 无变更则跳过同步
+            _dataDirty = false;
             try {
                 await syncToRemote(true);
             } catch (e) {
+                _dataDirty = true; // 同步失败，保留脏标记
                 console.debug('[Autofill] 自动同步失败:', e);
             }
         }, 3000);
@@ -937,14 +945,17 @@
 
     function saveForms() {
         GM_setValue(STORAGE_SAVED_FORMS, savedForms);
+        markDirty();
         scheduleAutoSync();
     }
     function savePresets() {
         GM_setValue(STORAGE_PRESETS, presets);
+        markDirty();
         scheduleAutoSync();
     }
     function saveStats() {
         GM_setValue(STORAGE_STATS, stats);
+        markDirty();
         scheduleAutoSync();
     }
 
@@ -1001,7 +1012,7 @@
 
     // ---------- 2. 一键撤销填充 ----------
     function saveFillHistory() {
-        fillHistory.push(collectFormFields());
+        fillHistory.push(getCachedFormFields());
         if (fillHistory.length > 10) fillHistory.shift();
     }
 
@@ -1056,12 +1067,16 @@
 
     // ---------- 自动保存草稿（静默保存，不弹窗） ----------
     let autoSaveTimer = null;
+    let _lastDraftJson = ''; // 用于检测草稿是否变化
     function startAutoSave() {
         // 静默保存草稿到本地存储，不弹窗打扰用户
         autoSaveTimer = setInterval(() => {
-            const fields = collectFormFields();
+            const fields = getCachedFormFields();
             const hasContent = fields.some(f => f.value && String(f.value).trim() !== '');
             if (hasContent) {
+                const draftJson = JSON.stringify(fields.map(f => ({ identifier: f.identifier, value: f.value })));
+                if (draftJson === _lastDraftJson) return; // 内容无变化，跳过保存
+                _lastDraftJson = draftJson;
                 currentDraft = {
                     url: location.href,
                     title: document.title,
@@ -1165,7 +1180,7 @@
 
     // 基于智能学习的字段匹配（增强 fuzzyMatch）
     function smartMatchFields(savedFields) {
-        const currentFields = collectFormFields();
+        const currentFields = getCachedFormFields();
         const matched = [];
 
         for (const saved of savedFields) {
@@ -1331,6 +1346,120 @@
         NATIVE_TIME: 'native-time'
     };
 
+    // ========== 框架配置表 ==========
+
+    const FRAMEWORK_DETECTION = [
+        { prefix: 'element', input: '.el-input', select: '.el-select', radio: '.el-radio', checkbox: '.el-checkbox', cascader: '.el-cascader', date: '.el-date-editor, .el-date-picker' },
+        { prefix: 'ant', input: '.ant-input', select: '.ant-select', radio: '.ant-radio', checkbox: '.ant-checkbox', cascader: '.ant-cascader', date: '.ant-picker' },
+        { prefix: 'iview', input: '.ivu-input', select: '.ivu-select', radio: '.ivu-radio', checkbox: '.ivu-checkbox', cascader: '.ivu-cascader' },
+        { prefix: 'vant', input: '.van-field', select: '.van-picker', radio: '.van-radio', checkbox: '.van-checkbox' }
+    ];
+
+    const FRAMEWORK_MAP = {
+        element: {
+            formItem: '.el-form-item',
+            formItemLabel: '.el-form-item__label',
+            containerSelectors: '.el-input, .el-select, .el-radio, .el-checkbox, .el-cascader, .el-date-editor',
+            radio: { wrappers: ['.el-radio'], checkedClasses: ['is-checked'] },
+            checkbox: { wrappers: ['.el-checkbox'], checkedClasses: ['is-checked'] }
+        },
+        ant: {
+            formItem: '.ant-form-item',
+            formItemLabel: '.ant-form-item-label label',
+            containerSelectors: '.ant-input, .ant-select, .ant-radio, .ant-checkbox, .ant-cascader, .ant-picker',
+            radio: { wrappers: ['.ant-radio-wrapper', '.ant-radio'], checkedClasses: ['ant-radio-wrapper-checked', 'ant-radio-checked'] },
+            checkbox: { wrappers: ['.ant-checkbox-wrapper', '.ant-checkbox'], checkedClasses: ['ant-checkbox-wrapper-checked', 'ant-checkbox-checked'] }
+        },
+        iview: {
+            formItem: '.ivu-form-item',
+            formItemLabel: '.ivu-form-item-label',
+            containerSelectors: '.ivu-input, .ivu-select, .ivu-radio, .ivu-checkbox, .ivu-cascader',
+            radio: { wrappers: ['.ivu-radio-wrapper'], checkedClasses: ['ivu-radio-checked'] },
+            checkbox: { wrappers: ['.ivu-checkbox-wrapper'], checkedClasses: ['ivu-checkbox-checked'] }
+        },
+        vant: {
+            formItem: '.van-field',
+            formItemLabel: '.van-field__label',
+            containerSelectors: '.van-field, .van-radio, .van-checkbox, .van-picker',
+            radio: { wrappers: ['.van-radio'], checkedClasses: ['van-radio--checked'] },
+            checkbox: { wrappers: ['.van-checkbox'], checkedClasses: ['van-checkbox--checked'] }
+        }
+    };
+
+    function getVueInstance(node) {
+        if (!node) return null;
+        return node.__vue__ || node._vnode?.component?.proxy || node.__vueParentComponent?.proxy || null;
+    }
+
+    function findFormItemLabel(element) {
+        const allFormItems = Object.values(FRAMEWORK_MAP).map(fw => fw.formItem).join(', ');
+        let formItem = element.closest(allFormItems);
+        if (formItem && formItem.className && formItem.className.includes('__content')) {
+            formItem = formItem.parentElement?.closest(allFormItems);
+        }
+        if (formItem) {
+            for (const fw of Object.values(FRAMEWORK_MAP)) {
+                const label = formItem.querySelector(fw.formItemLabel);
+                if (label && label.innerText.trim()) return label.innerText.trim();
+            }
+            const genericLabel = formItem.querySelector('label');
+            if (genericLabel && genericLabel.innerText.trim()) return genericLabel.innerText.trim();
+        }
+        return '';
+    }
+
+    function createRadioHandler(config) {
+        return {
+            getValue: (el) => {
+                for (let i = 0; i < config.wrappers.length; i++) {
+                    const wrapper = el.closest(config.wrappers[i]);
+                    if (wrapper && wrapper.classList.contains(config.checkedClasses[i])) {
+                        return el.value;
+                    }
+                }
+                return el.checked ? el.value : '';
+            },
+            setValue: (el, value) => {
+                const wrapper = config.wrappers.reduce((found, sel) => found || el.closest(sel), null);
+                if (el.value === value || fuzzyMatch(el.value, String(value))) {
+                    if (wrapper) {
+                        wrapper.click();
+                    } else {
+                        el.checked = true;
+                        triggerEvents(el, ['change', 'click']);
+                    }
+                }
+            }
+        };
+    }
+
+    function createCheckboxHandler(config) {
+        return {
+            getValue: (el) => {
+                for (let i = 0; i < config.wrappers.length; i++) {
+                    const wrapper = el.closest(config.wrappers[i]);
+                    if (wrapper && wrapper.classList.contains(config.checkedClasses[i])) {
+                        return true;
+                    }
+                }
+                return el.checked;
+            },
+            setValue: (el, value) => {
+                const wrapper = config.wrappers.reduce((found, sel) => found || el.closest(sel), null);
+                const shouldCheck = value === true || value === 'true' || value === el.value;
+                if (wrapper) {
+                    const isChecked = config.checkedClasses.some(cls => wrapper.classList.contains(cls));
+                    if (isChecked !== shouldCheck) {
+                        wrapper.click();
+                    }
+                } else {
+                    el.checked = shouldCheck;
+                    triggerEvents(el, ['change', 'click']);
+                }
+            }
+        };
+    }
+
     // ========== 增强模块：组件类型检测 ==========
 
     function detectComponentType(el) {
@@ -1360,38 +1489,15 @@
         if (role === 'checkbox') return COMPONENT_TYPES.ARIA_CHECKBOX;
 
         if (el.closest) {
-            if (el.closest('.el-input') && !el.closest('.el-select') && !el.closest('.el-cascader')) {
-                return COMPONENT_TYPES.ELEMENT_INPUT;
+            for (const fw of FRAMEWORK_DETECTION) {
+                const prefix = fw.prefix.toUpperCase();
+                if (fw.select && el.closest(fw.select)) return COMPONENT_TYPES[prefix + '_SELECT'];
+                if (fw.cascader && el.closest(fw.cascader)) return COMPONENT_TYPES[prefix + '_CASCADER'];
+                if (fw.date && el.closest(fw.date)) return COMPONENT_TYPES[prefix + '_DATE'];
+                if (fw.radio && el.closest(fw.radio)) return COMPONENT_TYPES[prefix + '_RADIO'];
+                if (fw.checkbox && el.closest(fw.checkbox)) return COMPONENT_TYPES[prefix + '_CHECKBOX'];
+                if (fw.input && el.closest(fw.input)) return COMPONENT_TYPES[prefix + '_INPUT'];
             }
-            if (el.closest('.el-select')) return COMPONENT_TYPES.ELEMENT_SELECT;
-            if (el.closest('.el-radio')) return COMPONENT_TYPES.ELEMENT_RADIO;
-            if (el.closest('.el-checkbox')) return COMPONENT_TYPES.ELEMENT_CHECKBOX;
-            if (el.closest('.el-cascader')) return COMPONENT_TYPES.ELEMENT_CASCADER;
-            if (el.closest('.el-date-editor, .el-date-picker')) return COMPONENT_TYPES.ELEMENT_DATE;
-
-            if (el.closest('.ant-input') && !el.closest('.ant-select') && !el.closest('.ant-cascader')) {
-                return COMPONENT_TYPES.ANT_INPUT;
-            }
-            if (el.closest('.ant-select')) return COMPONENT_TYPES.ANT_SELECT;
-            if (el.closest('.ant-radio')) return COMPONENT_TYPES.ANT_RADIO;
-            if (el.closest('.ant-checkbox')) return COMPONENT_TYPES.ANT_CHECKBOX;
-            if (el.closest('.ant-cascader')) return COMPONENT_TYPES.ANT_CASCADER;
-            if (el.closest('.ant-picker')) return COMPONENT_TYPES.ANT_DATE;
-
-            if (el.closest('.ivu-input') && !el.closest('.ivu-select') && !el.closest('.ivu-cascader')) {
-                return COMPONENT_TYPES.IVIEW_INPUT;
-            }
-            if (el.closest('.ivu-select')) return COMPONENT_TYPES.IVIEW_SELECT;
-            if (el.closest('.ivu-radio')) return COMPONENT_TYPES.IVIEW_RADIO;
-            if (el.closest('.ivu-checkbox')) return COMPONENT_TYPES.IVIEW_CHECKBOX;
-            if (el.closest('.ivu-cascader')) return COMPONENT_TYPES.IVIEW_CASCADER;
-
-            if (el.closest('.van-field') && !el.closest('.van-picker')) {
-                return COMPONENT_TYPES.VANT_INPUT;
-            }
-            if (el.closest('.van-picker')) return COMPONENT_TYPES.VANT_SELECT;
-            if (el.closest('.van-radio')) return COMPONENT_TYPES.VANT_RADIO;
-            if (el.closest('.van-checkbox')) return COMPONENT_TYPES.VANT_CHECKBOX;
         }
 
         if (tag === 'div' || tag === 'span') {
@@ -1543,7 +1649,7 @@
             setValue: (el, value) => {
                 const container = el.closest('.el-input');
                 if (container) {
-                    const vueInstance = container.__vue__ || container._vnode?.component?.proxy || container.__vueParentComponent?.proxy;
+                    const vueInstance = getVueInstance(container);
                     if (vueInstance) {
                         try {
                             vueInstance.$emit('update:modelValue', value);
@@ -1561,7 +1667,7 @@
             getValue: (el) => {
                 const container = el.closest('.el-select');
                 if (container) {
-                    const vueInstance = container.__vue__ || container._vnode?.component?.proxy || container.__vueParentComponent?.proxy;
+                    const vueInstance = getVueInstance(container);
                     if (vueInstance && vueInstance.modelValue !== undefined) return vueInstance.modelValue;
                     if (vueInstance && vueInstance.value !== undefined) return vueInstance.value;
                 }
@@ -1571,7 +1677,7 @@
                 const container = el.closest('.el-select');
                 if (!container) return;
 
-                const vueInstance = container.__vue__ || container._vnode?.component?.proxy || container.__vueParentComponent?.proxy;
+                const vueInstance = getVueInstance(container);
                 if (vueInstance) {
                     try {
                         vueInstance.$emit('update:modelValue', value);
@@ -1601,50 +1707,13 @@
                 }
             }
         },
-        [COMPONENT_TYPES.ELEMENT_RADIO]: {
-            getValue: (el) => {
-                const wrapper = el.closest('.el-radio');
-                if (wrapper && wrapper.classList.contains('is-checked')) {
-                    return el.value;
-                }
-                return el.checked ? el.value : '';
-            },
-            setValue: (el, value) => {
-                const wrapper = el.closest('.el-radio');
-                if (el.value === value || fuzzyMatch(el.value, String(value))) {
-                    if (wrapper) {
-                        wrapper.click();
-                    } else {
-                        el.checked = true;
-                        triggerEvents(el, ['change', 'click']);
-                    }
-                }
-            }
-        },
-        [COMPONENT_TYPES.ELEMENT_CHECKBOX]: {
-            getValue: (el) => {
-                const wrapper = el.closest('.el-checkbox');
-                return wrapper && wrapper.classList.contains('is-checked') ? true : el.checked;
-            },
-            setValue: (el, value) => {
-                const wrapper = el.closest('.el-checkbox');
-                const shouldCheck = value === true || value === 'true' || value === el.value;
-                if (wrapper) {
-                    const isChecked = wrapper.classList.contains('is-checked');
-                    if (isChecked !== shouldCheck) {
-                        wrapper.click();
-                    }
-                } else {
-                    el.checked = shouldCheck;
-                    triggerEvents(el, ['change', 'click']);
-                }
-            }
-        },
+        [COMPONENT_TYPES.ELEMENT_RADIO]: createRadioHandler(FRAMEWORK_MAP.element.radio),
+        [COMPONENT_TYPES.ELEMENT_CHECKBOX]: createCheckboxHandler(FRAMEWORK_MAP.element.checkbox),
         [COMPONENT_TYPES.ELEMENT_CASCADER]: {
             getValue: (el) => {
                 const container = el.closest('.el-cascader');
                 if (container) {
-                    const vueInstance = container.__vue__ || container._vnode?.component?.proxy || container.__vueParentComponent?.proxy;
+                    const vueInstance = getVueInstance(container);
                     if (vueInstance && vueInstance.modelValue !== undefined) return vueInstance.modelValue;
                 }
                 return el.value;
@@ -1655,7 +1724,7 @@
 
                 const valueArray = Array.isArray(values) ? values : [values];
 
-                const vueInstance = container.__vue__ || container._vnode?.component?.proxy || container.__vueParentComponent?.proxy;
+                const vueInstance = getVueInstance(container);
                 if (vueInstance) {
                     try {
                         vueInstance.$emit('update:modelValue', valueArray);
@@ -1696,7 +1765,7 @@
             setValue: (el, value) => {
                 const container = el.closest('.ant-input');
                 if (container) {
-                    const vueInstance = container.__vue__ || container._vnode?.component?.proxy || container.__vueParentComponent?.proxy;
+                    const vueInstance = getVueInstance(container);
                     if (vueInstance) {
                         try {
                             vueInstance.$emit('update:value', value);
@@ -1713,7 +1782,7 @@
             getValue: (el) => {
                 const container = el.closest('.ant-select');
                 if (container) {
-                    const vueInstance = container.__vue__ || container._vnode?.component?.proxy;
+                    const vueInstance = getVueInstance(container);
                     if (vueInstance && vueInstance.value !== undefined) return vueInstance.value;
                     const selectionItem = container.querySelector('.ant-select-selection-item');
                     if (selectionItem) return selectionItem.innerText.trim();
@@ -1724,7 +1793,7 @@
                 const container = el.closest('.ant-select');
                 if (!container) return;
 
-                const vueInstance = container.__vue__ || container._vnode?.component?.proxy;
+                const vueInstance = getVueInstance(container);
                 if (vueInstance) {
                     try {
                         vueInstance.$emit('update:value', value);
@@ -1751,58 +1820,13 @@
                 }
             }
         },
-        [COMPONENT_TYPES.ANT_RADIO]: {
-            getValue: (el) => {
-                const wrapper = el.closest('.ant-radio-wrapper');
-                if (wrapper && wrapper.classList.contains('ant-radio-wrapper-checked')) {
-                    return el.value;
-                }
-                const radio = el.closest('.ant-radio');
-                if (radio && radio.classList.contains('ant-radio-checked')) {
-                    return el.value;
-                }
-                return el.checked ? el.value : '';
-            },
-            setValue: (el, value) => {
-                const wrapper = el.closest('.ant-radio-wrapper') || el.closest('.ant-radio');
-                if (el.value === value || fuzzyMatch(el.value, String(value))) {
-                    if (wrapper) {
-                        wrapper.click();
-                    } else {
-                        el.checked = true;
-                        triggerEvents(el, ['change', 'click']);
-                    }
-                }
-            }
-        },
-        [COMPONENT_TYPES.ANT_CHECKBOX]: {
-            getValue: (el) => {
-                const wrapper = el.closest('.ant-checkbox-wrapper');
-                const checkbox = el.closest('.ant-checkbox');
-                return (wrapper && wrapper.classList.contains('ant-checkbox-wrapper-checked')) ||
-                       (checkbox && checkbox.classList.contains('ant-checkbox-checked')) ||
-                       el.checked;
-            },
-            setValue: (el, value) => {
-                const wrapper = el.closest('.ant-checkbox-wrapper') || el.closest('.ant-checkbox');
-                const shouldCheck = value === true || value === 'true' || value === el.value;
-                if (wrapper) {
-                    const isChecked = wrapper.classList.contains('ant-checkbox-wrapper-checked') ||
-                                     wrapper.classList.contains('ant-checkbox-checked');
-                    if (isChecked !== shouldCheck) {
-                        wrapper.click();
-                    }
-                } else {
-                    el.checked = shouldCheck;
-                    triggerEvents(el, ['change', 'click']);
-                }
-            }
-        },
+        [COMPONENT_TYPES.ANT_RADIO]: createRadioHandler(FRAMEWORK_MAP.ant.radio),
+        [COMPONENT_TYPES.ANT_CHECKBOX]: createCheckboxHandler(FRAMEWORK_MAP.ant.checkbox),
         [COMPONENT_TYPES.ANT_CASCADER]: {
             getValue: (el) => {
                 const container = el.closest('.ant-cascader');
                 if (container) {
-                    const vueInstance = container.__vue__ || container._vnode?.component?.proxy;
+                    const vueInstance = getVueInstance(container);
                     if (vueInstance && vueInstance.value !== undefined) return vueInstance.value;
                 }
                 return el.value;
@@ -1813,7 +1837,7 @@
 
                 const valueArray = Array.isArray(values) ? values : [values];
 
-                const vueInstance = container.__vue__ || container._vnode?.component?.proxy;
+                const vueInstance = getVueInstance(container);
                 if (vueInstance) {
                     try {
                         vueInstance.$emit('update:value', valueArray);
@@ -1868,7 +1892,7 @@
             setValue: (el, value) => {
                 const container = el.closest('.ivu-input');
                 if (container) {
-                    const vueInstance = container.__vue__;
+                    const vueInstance = getVueInstance(container);
                     if (vueInstance) {
                         try {
                             vueInstance.$emit('input', value);
@@ -1885,7 +1909,7 @@
             getValue: (el) => {
                 const container = el.closest('.ivu-select');
                 if (container) {
-                    const vueInstance = container.__vue__;
+                    const vueInstance = getVueInstance(container);
                     if (vueInstance && vueInstance.value !== undefined) return vueInstance.value;
                     const selected = container.querySelector('.ivu-select-selected-value');
                     if (selected) return selected.innerText.trim();
@@ -1896,7 +1920,7 @@
                 const container = el.closest('.ivu-select');
                 if (!container) return;
 
-                const vueInstance = container.__vue__;
+                const vueInstance = getVueInstance(container);
                 if (vueInstance) {
                     try {
                         vueInstance.$emit('input', value);
@@ -1923,50 +1947,13 @@
                 }
             }
         },
-        [COMPONENT_TYPES.IVIEW_RADIO]: {
-            getValue: (el) => {
-                const wrapper = el.closest('.ivu-radio-wrapper');
-                if (wrapper && wrapper.classList.contains('ivu-radio-checked')) {
-                    return el.value;
-                }
-                return el.checked ? el.value : '';
-            },
-            setValue: (el, value) => {
-                const wrapper = el.closest('.ivu-radio-wrapper');
-                if (el.value === value || fuzzyMatch(el.value, String(value))) {
-                    if (wrapper) {
-                        wrapper.click();
-                    } else {
-                        el.checked = true;
-                        triggerEvents(el, ['change', 'click']);
-                    }
-                }
-            }
-        },
-        [COMPONENT_TYPES.IVIEW_CHECKBOX]: {
-            getValue: (el) => {
-                const wrapper = el.closest('.ivu-checkbox-wrapper');
-                return wrapper && wrapper.classList.contains('ivu-checkbox-checked') ? true : el.checked;
-            },
-            setValue: (el, value) => {
-                const wrapper = el.closest('.ivu-checkbox-wrapper');
-                const shouldCheck = value === true || value === 'true' || value === el.value;
-                if (wrapper) {
-                    const isChecked = wrapper.classList.contains('ivu-checkbox-checked');
-                    if (isChecked !== shouldCheck) {
-                        wrapper.click();
-                    }
-                } else {
-                    el.checked = shouldCheck;
-                    triggerEvents(el, ['change', 'click']);
-                }
-            }
-        },
+        [COMPONENT_TYPES.IVIEW_RADIO]: createRadioHandler(FRAMEWORK_MAP.iview.radio),
+        [COMPONENT_TYPES.IVIEW_CHECKBOX]: createCheckboxHandler(FRAMEWORK_MAP.iview.checkbox),
         [COMPONENT_TYPES.IVIEW_CASCADER]: {
             getValue: (el) => {
                 const container = el.closest('.ivu-cascader');
                 if (container) {
-                    const vueInstance = container.__vue__;
+                    const vueInstance = getVueInstance(container);
                     if (vueInstance && vueInstance.value !== undefined) return vueInstance.value;
                 }
                 return el.value;
@@ -1977,7 +1964,7 @@
 
                 const valueArray = Array.isArray(values) ? values : [values];
 
-                const vueInstance = container.__vue__;
+                const vueInstance = getVueInstance(container);
                 if (vueInstance) {
                     try {
                         vueInstance.$emit('input', valueArray);
@@ -2018,7 +2005,7 @@
             setValue: (el, value) => {
                 const container = el.closest('.van-field');
                 if (container) {
-                    const vueInstance = container.__vue__ || container.__vueParentComponent?.proxy;
+                    const vueInstance = getVueInstance(container);
                     if (vueInstance) {
                         try {
                             vueInstance.$emit('update:modelValue', value);
@@ -2072,45 +2059,8 @@
                 }
             }
         },
-        [COMPONENT_TYPES.VANT_RADIO]: {
-            getValue: (el) => {
-                const wrapper = el.closest('.van-radio');
-                if (wrapper && wrapper.classList.contains('van-radio--checked')) {
-                    return el.value;
-                }
-                return el.checked ? el.value : '';
-            },
-            setValue: (el, value) => {
-                const wrapper = el.closest('.van-radio');
-                if (el.value === value || fuzzyMatch(el.value, String(value))) {
-                    if (wrapper) {
-                        wrapper.click();
-                    } else {
-                        el.checked = true;
-                        triggerEvents(el, ['change', 'click']);
-                    }
-                }
-            }
-        },
-        [COMPONENT_TYPES.VANT_CHECKBOX]: {
-            getValue: (el) => {
-                const wrapper = el.closest('.van-checkbox');
-                return wrapper && wrapper.classList.contains('van-checkbox--checked') ? true : el.checked;
-            },
-            setValue: (el, value) => {
-                const wrapper = el.closest('.van-checkbox');
-                const shouldCheck = value === true || value === 'true' || value === el.value;
-                if (wrapper) {
-                    const isChecked = wrapper.classList.contains('van-checkbox--checked');
-                    if (isChecked !== shouldCheck) {
-                        wrapper.click();
-                    }
-                } else {
-                    el.checked = shouldCheck;
-                    triggerEvents(el, ['change', 'click']);
-                }
-            }
-        }
+        [COMPONENT_TYPES.VANT_RADIO]: createRadioHandler(FRAMEWORK_MAP.vant.radio),
+        [COMPONENT_TYPES.VANT_CHECKBOX]: createCheckboxHandler(FRAMEWORK_MAP.vant.checkbox)
     };
 
     function triggerEvents(el, events) {
@@ -2216,13 +2166,13 @@
 
     function getComponentContainer(el, type) {
         if (type.startsWith('element-') || type.startsWith('ant-')) {
-            return el.closest('.el-input, .el-select, .el-radio, .el-checkbox, .el-cascader, .el-date-editor, .ant-input, .ant-select, .ant-radio, .ant-checkbox, .ant-cascader, .ant-picker');
+            return el.closest(FRAMEWORK_MAP.element.containerSelectors + ', ' + FRAMEWORK_MAP.ant.containerSelectors);
         }
         if (type.startsWith('iview-')) {
-            return el.closest('.ivu-input, .ivu-select, .ivu-radio, .ivu-checkbox, .ivu-cascader');
+            return el.closest(FRAMEWORK_MAP.iview.containerSelectors);
         }
         if (type.startsWith('vant-')) {
-            return el.closest('.van-field, .van-radio, .van-checkbox, .van-picker');
+            return el.closest(FRAMEWORK_MAP.vant.containerSelectors);
         }
         if (type === COMPONENT_TYPES.ARIA_RADIO || type === COMPONENT_TYPES.ARIA_CHECKBOX) {
             return el.closest('[role="radiogroup"], [role="group"]') || el;
@@ -2247,11 +2197,8 @@
         if (type && (type.startsWith('element-') || type.startsWith('ant-') || type.startsWith('iview-') || type.startsWith('vant-'))) {
             const container = getComponentContainer(el, type);
             if (container) {
-                const formItem = container.closest('.el-form-item, .ant-form-item, .ivu-form-item, .van-field, [class*="form-item"]');
-                if (formItem) {
-                    const label = formItem.querySelector('.el-form-item__label, .ant-form-item-label label, .ivu-form-item-label, .van-field__label, label');
-                    if (label && label.innerText.trim()) return label.innerText.trim();
-                }
+                const label = findFormItemLabel(container);
+                if (label) return label;
             }
         }
 
@@ -2379,20 +2326,9 @@
 
     // ---------- 智能提取字段标识符 (label文本/placeholder/name/id) ----------
     function getElementIdentifier(el) {
-        // 1. 从父级form-item获取label (Element Plus/Ant Design等框架优先)
-        let formItem = el.closest('.el-form-item, .ant-form-item, .ivu-form-item, .van-field');
-
-        // 如果匹配到的是 __content，继续向上查找
-        if (formItem && formItem.className.includes('__content')) {
-            formItem = formItem.parentElement?.closest('.el-form-item, .ant-form-item, .ivu-form-item, .van-field');
-        }
-
-        if (formItem) {
-            const label = formItem.querySelector('.el-form-item__label, .ant-form-item-label label, .ivu-form-item-label, .van-field__label');
-            if (label && label.innerText.trim()) {
-                return label.innerText.trim();
-            }
-        }
+        // 1. 从父级form-item获取label
+        const formItemLabel = findFormItemLabel(el);
+        if (formItemLabel) return formItemLabel;
 
         // 2. 关联label (for 或者父级label)
         let labelText = '';
@@ -2858,7 +2794,7 @@
             // Element Plus / Element UI
             if (type === 'element-plus' || type === 'element-ui') {
                 // 尝试从 Vue 实例获取
-                const vueInstance = container.__vue__ || container._vnode?.component?.proxy || container.__vueParentComponent?.proxy;
+                const vueInstance = getVueInstance(container);
                 if (vueInstance) {
                     if (vueInstance.modelValue !== undefined) return vueInstance.modelValue;
                     if (vueInstance.value !== undefined) return vueInstance.value;
@@ -2877,7 +2813,7 @@
             }
             // Ant Design
             if (type === 'ant-design') {
-                const vueInstance = container.__vue__ || container._vnode?.component?.proxy;
+                const vueInstance = getVueInstance(container);
                 if (vueInstance) {
                     if (vueInstance.value !== undefined) return vueInstance.value;
                     if (vueInstance.$props?.value !== undefined) return vueInstance.$props.value;
@@ -2888,7 +2824,7 @@
             }
             // iView
             if (type === 'iview') {
-                const vueInstance = container.__vue__;
+                const vueInstance = getVueInstance(container);
                 if (vueInstance && vueInstance.value !== undefined) return vueInstance.value;
                 const selected = container.querySelector('.ivu-select-selected-value');
                 if (selected) return selected.innerText.trim();
@@ -2896,7 +2832,7 @@
             }
             // Vant
             if (type === 'vant') {
-                const vueInstance = container.__vue__ || container.__vueParentComponent?.proxy;
+                const vueInstance = getVueInstance(container);
                 if (vueInstance && vueInstance.value !== undefined) return vueInstance.value;
                 const input = container.querySelector('.van-field__control');
                 if (input) return input.value;
@@ -2964,7 +2900,7 @@
             // Element Plus / Element UI - 需要打开下拉菜单才能获取选项
             if (type === 'element-plus' || type === 'element-ui') {
                 // 尝试从 Vue 实例获取选项列表
-                const vueInstance = container.__vue__ || container._vnode?.component?.proxy || container.__vueParentComponent?.proxy;
+                const vueInstance = getVueInstance(container);
                 if (vueInstance) {
                     // Element Plus
                     if (vueInstance.options) {
@@ -3036,7 +2972,7 @@
                 return input.value;
             }
             if (type.startsWith('element-')) {
-                const vueInstance = container.__vue__ || container._vnode?.component?.proxy || container.__vueParentComponent?.proxy;
+                const vueInstance = getVueInstance(container);
                 if (vueInstance) {
                     if (vueInstance.modelValue !== undefined) return vueInstance.modelValue;
                     if (vueInstance.value !== undefined) return vueInstance.value;
@@ -3045,7 +2981,7 @@
                 return input ? input.value : '';
             }
             if (type.startsWith('ant-')) {
-                const vueInstance = container.__vue__ || container._vnode?.component?.proxy;
+                const vueInstance = getVueInstance(container);
                 if (vueInstance) {
                     if (vueInstance.value !== undefined) return vueInstance.value;
                     if (vueInstance.$props?.value !== undefined) return vueInstance.$props.value;
@@ -3087,7 +3023,7 @@
                 return true;
             }
             if (type.startsWith('element-')) {
-                const vueInstance = container.__vue__ || container._vnode?.component?.proxy || container.__vueParentComponent?.proxy;
+                const vueInstance = getVueInstance(container);
                 if (vueInstance) {
                     if (typeof vueInstance.$emit === 'function') {
                         vueInstance.$emit('update:modelValue', value);
@@ -3108,7 +3044,7 @@
                 return true;
             }
             if (type.startsWith('ant-')) {
-                const vueInstance = container.__vue__ || container._vnode?.component?.proxy;
+                const vueInstance = getVueInstance(container);
                 if (vueInstance) {
                     if (typeof vueInstance.$emit === 'function') {
                         vueInstance.$emit('update:value', value);
@@ -3164,7 +3100,7 @@
             try {
                 // Element Plus / Element UI
                 if (type === 'element-plus' || type === 'element-ui') {
-                    const vueInstance = container.__vue__ || container._vnode?.component?.proxy || container.__vueParentComponent?.proxy;
+                    const vueInstance = getVueInstance(container);
                     if (vueInstance) {
                         if (typeof vueInstance.$emit === 'function') {
                             vueInstance.$emit('update:modelValue', value);
@@ -3217,7 +3153,7 @@
                 }
                 // Ant Design
                 if (type === 'ant-design') {
-                    const vueInstance = container.__vue__ || container._vnode?.component?.proxy;
+                    const vueInstance = getVueInstance(container);
                     if (vueInstance) {
                         if (typeof vueInstance.$emit === 'function') {
                             vueInstance.$emit('update:value', value);
@@ -3246,7 +3182,7 @@
                 }
                 // iView
                 if (type === 'iview') {
-                    const vueInstance = container.__vue__;
+                    const vueInstance = getVueInstance(container);
                     if (vueInstance) {
                         vueInstance.$emit('input', value);
                         vueInstance.$emit('on-change', value);
@@ -3256,7 +3192,7 @@
                 }
                 // Vant
                 if (type === 'vant') {
-                    const vueInstance = container.__vue__ || container.__vueParentComponent?.proxy;
+                    const vueInstance = getVueInstance(container);
                     if (vueInstance) {
                         if (typeof vueInstance.$emit === 'function') {
                             vueInstance.$emit('update:modelValue', value);
@@ -3361,7 +3297,7 @@
             if (processedCascaders.has(container)) return;
             processedCascaders.add(container);
 
-            const vueInstance = container.__vue__ || container._vnode?.component?.proxy || container.__vueParentComponent?.proxy;
+            const vueInstance = getVueInstance(container);
             let value = [];
             if (vueInstance && vueInstance.modelValue !== undefined) {
                 value = Array.isArray(vueInstance.modelValue) ? vueInstance.modelValue : [vueInstance.modelValue];
@@ -3389,7 +3325,7 @@
             if (processedCascaders.has(container)) return;
             processedCascaders.add(container);
 
-            const vueInstance = container.__vue__ || container._vnode?.component?.proxy;
+            const vueInstance = getVueInstance(container);
             let value = [];
             if (vueInstance && vueInstance.value !== undefined) {
                 value = Array.isArray(vueInstance.value) ? vueInstance.value : [vueInstance.value];
@@ -3417,7 +3353,7 @@
             if (processedCascaders.has(container)) return;
             processedCascaders.add(container);
 
-            const vueInstance = container.__vue__;
+            const vueInstance = getVueInstance(container);
             let value = [];
             if (vueInstance && vueInstance.value !== undefined) {
                 value = Array.isArray(vueInstance.value) ? vueInstance.value : [vueInstance.value];
@@ -3479,7 +3415,7 @@
                 let currentValue = '';
                 let placeholder = '';
 
-                const vueInstance = select.__vue__ || select._vnode?.component?.proxy || select.__vueParentComponent?.proxy;
+                const vueInstance = getVueInstance(select);
                 if (vueInstance) {
                     if (vueInstance.modelValue !== undefined) currentValue = vueInstance.modelValue;
                     else if (vueInstance.value !== undefined) currentValue = vueInstance.value;
@@ -3555,7 +3491,7 @@
                 }
             }
 
-            const vueInstance = select.__vue__ || select._vnode?.component?.proxy || select.__vueParentComponent?.proxy;
+            const vueInstance = getVueInstance(select);
             if (vueInstance) {
                 try {
                     vueInstance.$emit('update:modelValue', value);
@@ -3596,7 +3532,27 @@
         }
     }
 
-    function collectFormFields() {
+    // 字段收集缓存：短时间内多次调用只扫描一次 DOM
+    let _fieldCache = null;
+    let _fieldCacheTime = 0;
+    const FIELD_CACHE_TTL = 1000; // 1秒缓存
+
+    function invalidateFieldCache() {
+        _fieldCache = null;
+        _fieldCacheTime = 0;
+    }
+
+    function getCachedFormFields() {
+        const now = Date.now();
+        if (_fieldCache && (now - _fieldCacheTime) < FIELD_CACHE_TTL) {
+            return _fieldCache;
+        }
+        _fieldCache = _collectFormFieldsImpl();
+        _fieldCacheTime = now;
+        return _fieldCache;
+    }
+
+    function _collectFormFieldsImpl() {
         const fields = [];
         const processedRadios = new Set();
         const processedCheckboxes = new Set();
@@ -3952,6 +3908,7 @@
 
     // 核心填充函数: 根据fields数组填充表单
     async function fillFormWithFields(fields, saveHistory = true, allowEmpty = false) {
+        invalidateFieldCache();
         // 保存填充前的状态（用于撤销）
         if (saveHistory) {
             saveFillHistory();
@@ -4285,7 +4242,7 @@
         }
 
         if (saveHistory && fields.length > 0) {
-            const currentFields = collectFormFields();
+            const currentFields = getCachedFormFields();
             const learned = learnFromFill(fields, currentFields);
             if (learned > 0) {
                 console.debug(`[Autofill] 智能学习了 ${learned} 个字段映射关系`);
@@ -4622,13 +4579,13 @@
         const elInput = inputEl.closest('.el-input');
         if (elInput) {
             // 尝试多种方式获取 Vue 实例
-            let vueInstance = elInput.__vue__ || elInput._vnode?.component?.proxy || elInput.__vueParentComponent?.proxy;
+            let vueInstance = getVueInstance(elInput);
 
             // 尝试从父元素获取
             if (!vueInstance) {
                 const parent = elInput.parentElement;
                 if (parent) {
-                    vueInstance = parent.__vue__ || parent._vnode?.component?.proxy || parent.__vueParentComponent?.proxy;
+                    vueInstance = getVueInstance(parent);
                 }
             }
 
@@ -4636,7 +4593,7 @@
             if (!vueInstance) {
                 const formItem = elInput.closest('.el-form-item');
                 if (formItem) {
-                    vueInstance = formItem.__vue__ || formItem._vnode?.component?.proxy || formItem.__vueParentComponent?.proxy;
+                    vueInstance = getVueInstance(formItem);
                 }
             }
 
@@ -4660,7 +4617,7 @@
         // 尝试获取 Ant Design Vue 实例
         const antInput = inputEl.closest('.ant-input');
         if (antInput) {
-            const vueInstance = antInput.__vue__ || antInput._vnode?.component?.proxy || antInput.__vueParentComponent?.proxy;
+            const vueInstance = getVueInstance(antInput);
             if (vueInstance) {
                 try {
                     if (typeof vueInstance.$emit === 'function') {
@@ -4708,7 +4665,7 @@
 
     // 保存当前表单数据（使用Element UI风格对话框）
     function saveCurrentForm() {
-        let fields = collectFormFields();
+        let fields = getCachedFormFields();
         // 过滤掉验证码字段
         fields = filterCaptchaFields(fields);
         if (fields.length === 0) {
@@ -6021,7 +5978,7 @@
         if (recommended.length === 0) return;
 
         // 检查当前页面是否有表单
-        const currentFields = collectFormFields();
+        const currentFields = getCachedFormFields();
         if (currentFields.length === 0) return;
 
         // 过滤验证码字段
