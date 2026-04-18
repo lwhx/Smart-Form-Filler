@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         表单填充助手
 // @namespace    https://github.com/yourname/enhanced-autofill
-// @version      1.1.0
+// @version      1.1.1
 // @description  支持保存/填充各类表单数据(输入框、文本域、下拉框、单选框、复选框)，支持预设规则与自定义标题，完美适配移动端。支持Supabase云端同步。
-// @author       kk小志
+// @author       flykkk
 // @include      *://*/*login*
 // @include      *://*/register
 // @grant        GM_setValue
